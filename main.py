@@ -7,6 +7,7 @@ from __future__ import print_function
 import argparse
 import time
 import math
+import numpy as np
 import sys
 import warnings
 import torch
@@ -35,16 +36,16 @@ sys.stderr.write('Libraries loaded\n')
 parser = argparse.ArgumentParser(description='PyTorch RNN/LSTM Language Model')
 
 # Model parameters
-parser.add_argument('--model', type=str, default='LSTM',
-                    choices=['RNN_TANH', 'RNN_RELU', 'LSTM', 'GRU'],
+parser.add_argument('--model', type=str, default='CUEBASEDRNN',
+                    choices=['RNN_TANH', 'RNN_RELU', 'LSTM', 'GRU','CUEBASEDRNN'],
                     help='type of recurrent net')
-parser.add_argument('--emsize', type=int, default=200,
+parser.add_argument('--emsize', type=int, default=128,
                     help='size of word embeddings')
-parser.add_argument('--nhid', type=int, default=200,
+parser.add_argument('--nhid', type=int, default=128,
                     help='number of hidden units per layer')
-parser.add_argument('--nlayers', type=int, default=2,
+parser.add_argument('--nlayers', type=int, default=1,
                     help='number of layers')
-parser.add_argument('--lr', type=float, default=20,
+parser.add_argument('--lr', type=float, default=.1,
                     help='initial learning rate')
 parser.add_argument('--clip', type=float, default=0.25,
                     help='gradient clipping')
@@ -54,7 +55,7 @@ parser.add_argument('--batch_size', type=int, default=20, metavar='N',
                     help='batch size')
 parser.add_argument('--grad_accumulation_steps', type=int, default=1,
                     help='accumulates gradients over N sub-batches to avoid out of memory errors')
-parser.add_argument('--bptt', type=int, default=35,
+parser.add_argument('--bptt', type=int, default=45,
                     help='sequence length')
 parser.add_argument('--dropout', type=float, default=0.2,
                     help='dropout applied to layers (0 = no dropout)')
@@ -66,6 +67,8 @@ parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
 parser.add_argument('--init', type=float, default=None,
                     help='-1 to randomly Initialize. Otherwise, all parameter weights set to value')
+parser.add_argument('--auxobjective', action='store_true',
+                    help='use flag to train on an auxillary objective like CCG supertagging')
 
 # Data parameters
 parser.add_argument('--model_file', type=str, default='model.pt',
@@ -117,7 +120,7 @@ parser.add_argument('--verbose_view_layer', action='store_true',
 
 parser.add_argument('--words', action='store_true',
                     help='evaluate word-level complexities (instead of sentence-level loss)')
-parser.add_argument('--log_interval', type=int, default=200, metavar='N',
+parser.add_argument('--log_interval', type=int, default=100, metavar='N',
                     help='report interval')
 
 parser.add_argument('--lowercase', action='store_true',
@@ -152,7 +155,7 @@ if args.interact:
     args.test = True
     # Don't try to process multiple sentences in parallel interactively
     args.single = True
-
+    
 if args.adapt:
     # If adapting, we must be in test mode
     args.test = True
@@ -164,15 +167,17 @@ if args.view_layer != -1:
 # Set the random seed manually for reproducibility.
 torch.manual_seed(args.seed)
 if torch.cuda.is_available():
+    print("CUDA device availible")
     if not args.cuda:
         print("WARNING: You have a CUDA device, so you should probably run with --cuda")
     else:
+        print("using CUDA")
         torch.cuda.manual_seed(args.seed)
         if torch.cuda.device_count() == 1:
             args.single = True
 
 device = torch.device("cuda" if args.cuda else "cpu")
-
+torch.autograd.set_detect_anomaly(True)
 
 ###############################################################################
 # Load data
@@ -200,6 +205,102 @@ def batchify(data, bsz):
     # Turning the data over to CUDA at this point may lead to more OOM errors
     return data.to(device)
 
+def trunc_pad_and_mask(sequence, bptt, eos_token):
+    #pad sequence
+    if(len(sequence) < bptt):
+        sequence = np.pad(sequence, (0, bptt-len(sequence)), 'constant', constant_values=(0, 0))
+    #truncate sequence
+    elif(len(sequence)> bptt):
+        sequence = np.array(sequence[:bptt])
+    #compute sentence-level attention masks (token zero and eos attend only to position -1, no other token attends to -1)
+    #
+    mask = np.full((len(sequence), len(sequence) + 1),-np.inf)
+    mask[0,0] = 0 #first token can look at position -1
+    for i in range(len(sequence)):
+        for j in reversed(range(1, i+1)):
+            if(sequence[j] != eos_token and sequence[j-1] != eos_token): #allow attention if i is not eos, and prev is not eos
+                    mask[i,j] = 0
+            else: #attend to dummy position -1
+                if(i==j):
+                    mask[i,0] = 0
+                break
+    return sequence, mask
+
+
+def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=False):
+    #using (sloppy) heuristics such that every sequence is the start of a sentence, with minimal padding or cropping
+    #first split data back into sentences
+    print("Batching data + computing sentence-level attn masks.")
+    data_np = data.numpy()
+    idx = np.where(data_np!=0)[0]
+    idx2sent = np.split(data_np[idx],np.where(np.diff(idx)!=1)[0]+1)
+    idx2sent[0] = np.append(0, idx2sent[0])
+    for i in range(len(idx2sent)):
+        idx2sent[i] = np.append(idx2sent[i], 0)
+    sent_lens = dict()
+    for i in range(len(idx2sent)):
+        sen_len = len(idx2sent[i])
+        if sen_len not in sent_lens.keys():
+            sent_lens[sen_len] = {i}
+        else:
+            sent_lens[sen_len].add(i)
+    #remove sentences that are too short
+    for i in range(min_sent_len):
+        if i in sent_lens.keys():
+            sent_lens[i] = []
+    
+    sequences = []
+    masks = []
+    #heuristic 1: match pairs of sentences whose lengths add up to n, +/- some epsilon
+    for epsilon in [0,1,-1,2,-2,3,-3,4,-4,5,-5]:
+        for i in range(bptt + epsilon):
+            len_a = i
+            len_b = (bptt + epsilon) - i             
+            if len_a in sent_lens.keys() and len_b in sent_lens.keys():
+                while(len(sent_lens[len_a]) > 0 and len(sent_lens[len_b]) > 0):
+                    if(not(sent_lens[len_a] == sent_lens[len_b] and len(sent_lens[len_a]) <= 1)):
+                        sequence, mask = trunc_pad_and_mask(np.concatenate((idx2sent[sent_lens[len_a].pop()], idx2sent[sent_lens[len_b].pop()])), bptt,0)
+                        sequences.append(sequence)
+                        masks.append(mask)
+                    else:
+                        break
+    #next add sequences that are too long and truncate them
+    for length in sent_lens.keys():
+        if(length > bptt - 5):
+            while(len(sent_lens[length]) > 0):
+                sequence, mask = trunc_pad_and_mask(idx2sent[sent_lens[length].pop()],bptt,0)
+                sequences.append(sequence)
+                masks.append(mask)
+    print('Added truncd sents')
+    #finally, heuristic 2: from largest to smallest, add sequences until can't anymore (allowing +5 overflow)
+    for i in reversed(range((bptt - 5) + 1)): #40, 39, 38...
+        if(i in sent_lens.keys()):
+            while(len(sent_lens[i]) > 0): 
+                curr_sequence = idx2sent[sent_lens[i].pop()]
+                for j in reversed(range(1,i+1)):
+                    if(j in sent_lens.keys()):
+                        while((len(curr_sequence) + j) < (bptt + 5) and len(sent_lens[j]) > 0):
+                            curr_sequence = np.concatenate((curr_sequence, idx2sent[sent_lens[j].pop()]))
+                sequence, mask = trunc_pad_and_mask(curr_sequence,bptt,0)
+                if(len(sequences) == 45853):
+                    print('')
+                sequences.append(sequence)
+                masks.append(mask)
+    nbatch = len(sequences) // bsz 
+    even_seq = bsz * nbatch
+    remainder = len(sequences) - even_seq
+    for i in range(bsz-remainder):
+        sequences.append(sequences[even_seq+(i%remainder)])
+        masks.append(masks[even_seq+(i%remainder)])
+    sents = torch.from_numpy(np.array(sequences))
+    sents = sents.view(-1,bsz,bptt)
+    sents = sents.swapaxes(1,2)
+    masks = torch.from_numpy(np.array(masks, dtype=np.float32))
+    masks = masks.view(-1,bsz,bptt,bptt+1)
+    return sents.to(device), masks.to(device)
+
+
+
 try:
     with open(args.vocab_file, 'r') as f:
         # We're using a pre-existing vocab file, so we shouldn't overwrite it
@@ -220,13 +321,15 @@ corpus = data.SentenceCorpus(args.data_dir, args.vocab_file, args.test, args.int
 
 if not args.interact:
     if args.test:
+        print('testing')
         if args.multisentence_test:
             test_data = [corpus.test]
         else:
             test_sents, test_data = corpus.test
     else:
-        train_data = batchify(corpus.train, args.batch_size)
-        val_data = batchify(corpus.valid, args.batch_size)
+        train_data, train_masks = sent_level_batchify(corpus.train, args.bptt, args.batch_size)
+        #train_data = batchify(corpus.train, args.batch_size)
+        val_data, val_masks = sent_level_batchify(corpus.valid, args.bptt, args.batch_size)
 
 ###############################################################################
 # Build/load the model
@@ -243,7 +346,13 @@ if not args.test and not args.interact:
                 model = torch.load(f, map_location='cpu')
     else:
         ntokens = len(corpus.dictionary)
-        model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid,
+        if(args.model != 'CUEBASEDRNN'):
+            model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid,
+                               args.nlayers, embedding_file=args.embedding_file,
+                               dropout=args.dropout, tie_weights=args.tied,
+                               freeze_embedding=args.freeze_embedding).to(device)
+        else:
+            model = model.CueBasedRNNModel(ntokens, args.emsize, args.nhid,
                                args.nlayers, embedding_file=args.embedding_file,
                                dropout=args.dropout, tie_weights=args.tied,
                                freeze_embedding=args.freeze_embedding).to(device)
@@ -257,7 +366,8 @@ if not args.test and not args.interact:
         model = model.module
     # after load the rnn params are not a continuous chunk of memory
     # this makes them a continuous chunk, and will speed up forward pass
-    model.rnn.flatten_parameters()
+    if(args.model != 'CUEBASEDRNN'):
+        model.rnn.flatten_parameters()
     # setup model with optimizer and scheduler
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, nesterov=True)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min',patience=0,factor=0.1)
@@ -354,7 +464,7 @@ def repackage_hidden(in_state):
     else:
         return tuple(repackage_hidden(value) for value in in_state)
 
-def get_batch(source, i):
+def get_batch(source, i, prebatched=False, masks=None):
     """ get_batch subdivides the source data into chunks of length args.bptt.
     If source is equal to the example output of the batchify function, with
     a bptt-limit of 2, we'd get the following two Variables for i = 0:
@@ -364,10 +474,18 @@ def get_batch(source, i):
     done along the batch dimension (i.e. dimension 1), since that was handled
     by the batchify function. The chunks are along dimension 0, corresponding
     to the seq_len dimension in the LSTM. """
-    seq_len = min(args.bptt, len(source) - 1 - i)
-    data = source[i:i+seq_len]
-    target = source[i+1:i+1+seq_len]
-    return data, target.long()
+    if(not prebatched):
+        seq_len = min(args.bptt, len(source) - 1 - i)
+        data = source[i:i+seq_len]
+        target = source[i+1:i+1+seq_len]
+        return data, target.long()
+    else:
+        data = source[i,:-1,:]
+        target = source[i,1:,:]
+        if(masks is not None):
+            mask = masks[i,:,:-1,:-1]
+            return data, target.long(), mask
+        return data, target.long()
 
 def test_get_batch(source):
     """ Creates an input/target pair for evaluation """
@@ -415,18 +533,23 @@ def test_evaluate(test_sentences, data_source):
         # We predict all words but the first, so determine loss for those
         if test_sentences:
             sent = test_sentences[i]
-        hidden = model.init_hidden(1) # number of parallel sentences being processed
+        if(args.model != 'CUEBASEDRNN'):
+            hidden = model.init_hidden(1) # number of parallel sentences being processed
         data, targets = test_get_batch(sent_ids)
         nwords += targets.flatten().size(0)
         if args.view_layer >= 0:
             for word_index in range(data.size(0)):
                 # Starting each batch, detach the hidden state
-                hidden = repackage_hidden(hidden)
+                
+                #hidden = repackage_hidden(hidden)
                 model.zero_grad()
 
                 word_input = data[word_index].unsqueeze(0).unsqueeze(1)
                 target = targets[word_index].unsqueeze(0)
-                output, hidden = model(word_input, hidden)
+                if(args.model != 'CUEBASEDRNN'):
+                    output, hidden = model(word_input, hidden)
+                else:
+                    output, hidden = model(word_input)
                 output_flat = output.view(-1, ntokens)
                 loss = criterion(output_flat, target)
                 total_loss += loss.sum().item()
@@ -450,9 +573,13 @@ def test_evaluate(test_sentences, data_source):
                     else:
                         # output cell state
                         print(*list(hidden[1][args.view_layer].view(1, -1).data.cpu().numpy().flatten()), sep=' ')
+                hidden = repackage_hidden(hidden)
         else:
             data = data.unsqueeze(1) # only needed when a single sentence is being processed
-            output, hidden = model(data, hidden)
+            if(args.model != 'CUEBASEDRNN'):
+                output, hidden = model(data, hidden)
+            else:
+                output, hidden = model(data)
             try:
                 output_flat = output.view(-1, ntokens)
             except RuntimeError:
@@ -466,9 +593,9 @@ def test_evaluate(test_sentences, data_source):
             else:
                 # output sentence-level loss
                 if test_sentences:
-                    print(str(sent)+":"+str(loss.item()))
+                    print(str(sent)+":"+str(loss))
                 else:
-                    print(str(loss.item()))
+                    print(str(loss))
 
             if args.adapt:
                 loss.mean().backward()
@@ -492,21 +619,26 @@ def evaluate(data_source):
     total_loss = 0.
     ntokens = len(corpus.dictionary)
     with torch.no_grad():
-        actual_batch_size = int(args.batch_size / args.grad_accumulation_steps)
         # Construct hidden layers for each sub-batch
         hidden_batch = []
-        for i in range(args.grad_accumulation_steps):
-            hidden_batch.append(model.init_hidden(actual_batch_size))
+        if(args.model != 'CUEBASEDRNN'):
+            for i in range(args.grad_accumulation_steps):
+                hidden_batch.append(model.init_hidden(args.batch_size))
+
+        for i in range(0, data_source.size(0), args.bptt):
+            if(args.model != 'CUEBASEDRNN'):
+                batch_data, batch_targets = get_batch(data_source, i)
+            else:
+                batch_data, batch_targets, batch_masks = get_batch(data_source, i, prebatched=True, masks=val_masks)
             
-        for i in range(0, data_source.size(0) - 1, args.bptt):
-            batch_data, batch_targets = get_batch(data_source, i)
-            for sub_batch_ix in range(args.grad_accumulation_steps):
-                sub_batch_start = sub_batch_ix * actual_batch_size
-                sub_batch_end = (sub_batch_ix + 1) * actual_batch_size
-                output, hidden_batch[sub_batch_ix] = model(batch_data[:,sub_batch_start:sub_batch_end], hidden_batch[sub_batch_ix])
-                output_flat = output.view(-1, ntokens)
-                total_loss += criterion(output_flat, batch_targets[:,sub_batch_start:sub_batch_end].flatten()).sum().item()
-    return total_loss / data_source.flatten().size(0)
+            if(args.model != 'CUEBASEDRNN'):
+                output, hidden_batch = model(batch_data, hidden_batch)
+            else:
+                output, hidden_subbatch = model(batch_data, batch_masks)
+                hidden_batch.append(hidden_subbatch[-1])
+            output_flat = output.view(-1, ntokens)
+            total_loss += criterion(output_flat, batch_targets.flatten()).sum().item()
+    return total_loss / (data_source.size(0) * args.bsz)
 
 def train():
     """ Train language model """
@@ -518,19 +650,24 @@ def train():
     ntokens = len(corpus.dictionary)
     actual_batch_size = int(args.batch_size / args.grad_accumulation_steps)
     hidden_batch = []
-    for i in range(args.grad_accumulation_steps):
-        hidden_batch.append(model.init_hidden(actual_batch_size))
+    if(args.model != 'CUEBASEDRNN'):
+        for i in range(args.grad_accumulation_steps):
+            hidden_batch.append(model.init_hidden(actual_batch_size))
         
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
-        batch_data, batch_targets = get_batch(train_data, i)
-        for sub_batch_ix in range(args.grad_accumulation_steps):
-            sub_batch_start = sub_batch_ix * actual_batch_size
-            sub_batch_end = (sub_batch_ix + 1) * actual_batch_size
-            output, hidden_batch[sub_batch_ix] = model(batch_data[:,sub_batch_start:sub_batch_end], hidden_batch[sub_batch_ix])
-            
-            loss = criterion(output.view(-1, ntokens), batch_targets[:,sub_batch_start:sub_batch_end].flatten())
-            total_loss += loss.sum().item()
-            loss.mean().backward()
+    for batch in range(0, train_data.size(0)):
+        if(args.model != 'CUEBASEDRNN'):
+            batch_data, batch_targets = get_batch(train_data, batch)
+        else:
+            batch_data, batch_targets, batch_masks = get_batch(train_data, batch, prebatched=True, masks=train_masks)
+
+        if(args.model != 'CUEBASEDRNN'):
+            output, hidden_batch = model(batch_data, hidden_batch)
+        else:
+            output, hidden_batch_all = model(batch_data, batch_masks)
+            hidden_batch = hidden_batch_all[-1]
+        loss = criterion(output.view(-1, ntokens), batch_targets.flatten())
+        total_loss += loss.sum().item()
+        loss.mean().backward()
         total_data += batch_data.flatten().size(0)
         
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
@@ -539,8 +676,7 @@ def train():
 
         # Detach the hidden state from how it was previously produced.
         # If we didn't, the model would try backpropagating all the way to start of the dataset.
-        for sub_batch_ix in range(args.grad_accumulation_steps):
-            hidden_batch[sub_batch_ix] = repackage_hidden(hidden_batch[sub_batch_ix])
+        hidden_batch = repackage_hidden(hidden_batch)
         model.zero_grad()
 
         if batch % args.log_interval == 0 and batch > 0:
@@ -548,7 +684,7 @@ def train():
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
                   'loss {:5.2f} | ppl {:8.2f}'.format(
-                      epoch, batch, len(train_data) // args.bptt, float(optimizer.param_groups[0]['lr']),
+                      epoch, batch, train_data.size(0), float(optimizer.param_groups[0]['lr']),
                       elapsed * 1000 / args.log_interval, curr_loss, math.exp(curr_loss)))
             total_loss = 0.
             total_data = 0.
@@ -606,7 +742,8 @@ else:
         if isinstance(model, torch.nn.DataParallel):
             # if multi-gpu, access real model for testing
             model = model.module
-        model.rnn.flatten_parameters()
+        if(args.model != 'CUEBASEDRNN'):
+            model.rnn.flatten_parameters()
         
         # setup model with optimizer and scheduler
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, nesterov=True)
