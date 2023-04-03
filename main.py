@@ -205,7 +205,7 @@ def batchify(data, bsz):
     # Turning the data over to CUDA at this point may lead to more OOM errors
     return data.to(device)
 
-def trunc_pad_and_mask(sequence, bptt, eos_token):
+def trunc_pad_and_mask(sequence, bptt, eos_token, compute_masks):
     #pad sequence
     if(len(sequence) < bptt):
         sequence = np.pad(sequence, (0, bptt-len(sequence)), 'constant', constant_values=(0, 0))
@@ -214,23 +214,22 @@ def trunc_pad_and_mask(sequence, bptt, eos_token):
         sequence = np.array(sequence[:bptt])
     #compute sentence-level attention masks (token zero and eos attend only to position -1, no other token attends to -1)
     #
-    mask = np.full((len(sequence), len(sequence) + 1),-np.inf)
-    mask[0,0] = 0 #first token can look at position -1
-    for i in range(len(sequence)):
-        for j in reversed(range(1, i+1)):
-            if(sequence[j] != eos_token and sequence[j-1] != eos_token): #allow attention if i is not eos, and prev is not eos
-                    mask[i,j] = 0
-            else: #attend to dummy position -1
-                if(i==j):
-                    mask[i,0] = 0
-                break
+    if(compute_masks):
+        mask = np.full((len(sequence), len(sequence) + 1),-np.inf)
+        mask[0,0] = 0 #first token can look at position -1
+        for i in range(len(sequence)):
+            for j in reversed(range(1, i+1)):
+                if(sequence[j] != eos_token and sequence[j-1] != eos_token): #allow attention if i is not eos, and prev is not eos
+                        mask[i,j] = 0
+                else: #attend to dummy position -1
+                    if(i==j):
+                        mask[i,0] = 0
+                    break
+    else:
+        mask = None
     return sequence, mask
 
-
-def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=False):
-    #using (sloppy) heuristics such that every sequence is the start of a sentence, with minimal padding or cropping
-    #first split data back into sentences
-    print("Batching data + computing sentence-level attn masks.")
+def get_sent_list_lens_from_data_tensor(data, min_sent_len):
     data_np = data.numpy()
     idx = np.where(data_np!=0)[0]
     idx2sent = np.split(data_np[idx],np.where(np.diff(idx)!=1)[0]+1)
@@ -248,7 +247,9 @@ def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=False):
     for i in range(min_sent_len):
         if i in sent_lens.keys():
             sent_lens[i] = []
-    
+    return idx2sent, sent_lens
+
+def pack_sentences(idx2sent, sent_lens, bptt, bsz, min_sent_len, compute_masks):
     sequences = []
     masks = []
     #heuristic 1: match pairs of sentences whose lengths add up to n, +/- some epsilon
@@ -259,7 +260,7 @@ def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=False):
             if len_a in sent_lens.keys() and len_b in sent_lens.keys():
                 while(len(sent_lens[len_a]) > 0 and len(sent_lens[len_b]) > 0):
                     if(not(sent_lens[len_a] == sent_lens[len_b] and len(sent_lens[len_a]) <= 1)):
-                        sequence, mask = trunc_pad_and_mask(np.concatenate((idx2sent[sent_lens[len_a].pop()], idx2sent[sent_lens[len_b].pop()])), bptt,0)
+                        sequence, mask = trunc_pad_and_mask(np.concatenate((idx2sent[sent_lens[len_a].pop()], idx2sent[sent_lens[len_b].pop()])), bptt,0, compute_masks)
                         sequences.append(sequence)
                         masks.append(mask)
                     else:
@@ -268,10 +269,10 @@ def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=False):
     for length in sent_lens.keys():
         if(length > bptt - 5):
             while(len(sent_lens[length]) > 0):
-                sequence, mask = trunc_pad_and_mask(idx2sent[sent_lens[length].pop()],bptt,0)
+                sequence, mask = trunc_pad_and_mask(idx2sent[sent_lens[length].pop()], bptt, 0, compute_masks)
                 sequences.append(sequence)
                 masks.append(mask)
-    print('Added truncd sents')
+
     #finally, heuristic 2: from largest to smallest, add sequences until can't anymore (allowing +5 overflow)
     for i in reversed(range((bptt - 5) + 1)): #40, 39, 38...
         if(i in sent_lens.keys()):
@@ -281,32 +282,48 @@ def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=False):
                     if(j in sent_lens.keys()):
                         while((len(curr_sequence) + j) < (bptt + 5) and len(sent_lens[j]) > 0):
                             curr_sequence = np.concatenate((curr_sequence, idx2sent[sent_lens[j].pop()]))
-                sequence, mask = trunc_pad_and_mask(curr_sequence,bptt,0)
+                sequence, mask = trunc_pad_and_mask(curr_sequence,bptt,0, compute_masks)
                 if(len(sequences) == 45853):
                     print('')
                 sequences.append(sequence)
                 masks.append(mask)
+    return sequences, masks
 
+
+def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=True):
+    #using (sloppy) heuristics such that every sequence is the start of a sentence, with minimal padding or cropping
+    #first split data back into sentences
+    if(compute_masks):
+        print("Packing data into batches + computing sentence-level attention masks")
+    else:
+        print("Packing data into batches")
+
+    idx2sent, sent_lens = get_sent_list_lens_from_data_tensor(data, min_sent_len)
+    sequences, masks = pack_sentences(idx2sent, sent_lens, bptt, bsz, min_sent_len, compute_masks)
 
     nbatch = len(sequences) // bsz 
     even_seq = bsz * nbatch
     remainder = len(sequences) - even_seq
     for i in range(bsz-remainder):
         sequences.append(sequences[even_seq+(i%remainder)])
-        masks.append(masks[even_seq+(i%remainder)])
+        if(compute_masks):
+            masks.append(masks[even_seq+(i%remainder)])
     sequences = np.array(sequences)
     sents = np.array(sequences)
-    masks = np.array(masks, dtype=np.float32)
+    if(compute_masks):
+        masks = np.array(masks, dtype=np.float32)
 
     rand_inds = np.arange(sents.shape[0])
     np.random.shuffle(rand_inds)
     sents = torch.from_numpy(sents[rand_inds])
-    masks = torch.from_numpy(masks[rand_inds])
-
     sents = sents.view(-1,bsz,bptt)
     sents = sents.swapaxes(1,2)
-    masks = masks.view(-1,bsz,bptt,bptt+1)
-    return sents.to(device), masks.to(device)
+    if compute_masks:
+        masks = torch.from_numpy(masks[rand_inds])
+        masks = masks.view(-1,bsz,bptt,bptt+1)
+        return sents.to(device), masks.to(device)
+    else:
+        return sents.to(device)
 
 
 
@@ -336,9 +353,10 @@ if not args.interact:
         else:
             test_sents, test_data = corpus.test
     else:
-        train_data, train_masks = sent_level_batchify(corpus.train, args.bptt, args.batch_size)
+        compute_masks = args.model == 'CUEBASEDRNN'
+        train_data, train_masks = sent_level_batchify(corpus.train, args.bptt, args.batch_size, compute_masks=compute_masks)
         #train_data = batchify(corpus.train, args.batch_size)
-        val_data, val_masks = sent_level_batchify(corpus.valid, args.bptt, args.batch_size)
+        val_data, val_masks = sent_level_batchify(corpus.valid, args.bptt, args.batch_size, compute_masks=compute_masks)
 
 ###############################################################################
 # Build/load the model
@@ -635,16 +653,15 @@ def evaluate(data_source):
                 hidden_batch.append(model.init_hidden(args.batch_size))
 
         for i in range(data_source.size(0)):
-            if(args.model != 'CUEBASEDRNN'):
-                batch_data, batch_targets = get_batch(data_source, i)
-            else:
+            if(args.model == 'CUEBASEDRNN'):
                 batch_data, batch_targets, batch_masks = get_batch(data_source, i, prebatched=True, masks=val_masks)
-            
-            if(args.model != 'CUEBASEDRNN'):
-                output, hidden_batch = model(batch_data, hidden_batch)
+                output, hidden_subbatch, _ = model(batch_data, batch_masks)
+                hidden_batch.append(hidden_subbatch[-1])  
             else:
-                output, hidden_subbatch = model(batch_data, batch_masks)
-                hidden_batch.append(hidden_subbatch[-1])
+                batch_data, batch_targets = get_batch(data_source, i, prebatched=True)
+                output, hidden_batch = model(batch_data, hidden_batch)
+         
+
             output_flat = output.view(-1, ntokens)
             total_loss += criterion(output_flat, batch_targets.flatten()).sum().item()
     return total_loss / (data_source.flatten().size(0))
@@ -659,21 +676,20 @@ def train():
     ntokens = len(corpus.dictionary)
     actual_batch_size = int(args.batch_size / args.grad_accumulation_steps)
     hidden_batch = []
+    #if model is RNN, then pre-initialize hidden states for the batch, CUE-based model does this in the forward pass (which is bad?)
     if(args.model != 'CUEBASEDRNN'):
         for i in range(args.grad_accumulation_steps):
             hidden_batch.append(model.init_hidden(actual_batch_size))
         
     for batch in range(0, train_data.size(0)):
-        if(args.model != 'CUEBASEDRNN'):
-            batch_data, batch_targets = get_batch(train_data, batch)
-        else:
+        if(args.model == 'CUEBASEDRNN'):
             batch_data, batch_targets, batch_masks = get_batch(train_data, batch, prebatched=True, masks=train_masks)
-
-        if(args.model != 'CUEBASEDRNN'):
-            output, hidden_batch = model(batch_data, hidden_batch)
-        else:
-            output, hidden_batch_all = model(batch_data, batch_masks)
+            output, hidden_batch_all, _ = model(batch_data, masks=batch_masks)
             hidden_batch = hidden_batch_all[-1]
+        else:
+            batch_data, batch_targets = get_batch(train_data, batch)
+            output, hidden_batch = model(batch_data, hidden_batch)
+  
         loss = criterion(output.view(-1, ntokens), batch_targets.flatten())
         total_loss += loss.sum().item()
         loss.mean().backward()

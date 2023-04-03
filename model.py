@@ -201,7 +201,7 @@ class CueBasedRNNModel(nn.Module):
     
     #b = batch size, n = sequence length, d = dimensionality 
     #masks are of size b * n * n+1 - dim 3 is token a attending token b in dim 4
-    def forward(self, observation, masks):
+    def forward(self, observation, masks=None):
         #todo - initialize outside of forward pass
         hidden, key_cache, value_cache = self.init_cache(observation)
         seq_len = observation.size(dim=0)
@@ -214,16 +214,16 @@ class CueBasedRNNModel(nn.Module):
             query_n = query.unsqueeze(-1) #b * n * 1
 
             #compute attention scores against all keys w_-1 to w_i-1
-            #todo: make w_-1 inaccessible for attention after first pass
-
-            #[b * i * d] * [b * d * 1] = b * i * 1 squeeze() -> [b * i]
             attn_scores = torch.bmm(key_cache.swapaxes(0,1), query_n).squeeze(dim=-1)
-            masked_scores = attn_scores + masks[:,i,:i+1]
+            if(masks is not None):
+                masked_scores = attn_scores + masks[:,i,:i+1]
+            else:
+                masked_scores = attn_scores
             #divide scores by sqrt(nhid) for more stable gradients, then compute score using specified function (default: softmax)
-            attn_weights = self.score_attn(masked_scores / self.attn_div_factor)  #b * i or b when i=0 - is this a problem?
-            #weighted sum over attention scores to get final attention vector                    
-            #[(i * b) * 1] * [i * b * d] = i * b * d.sum(axis = 0) = b * d
-            attn = (attn_weights.T.unsqueeze(-1) * value_cache).sum(axis=0) #b * d  - attn_weights b * i * 1
+            attn_weights = self.score_attn(masked_scores / self.attn_div_factor)
+            #weighted sum over attention scores to get final attention vector  
+            #todo - clean up mm code somewhat - very sloppy
+            attn = (attn_weights.T.unsqueeze(-1) * value_cache).sum(axis=0)
 
             #feed-forward component
             #project to large intermediate layer
@@ -231,24 +231,21 @@ class CueBasedRNNModel(nn.Module):
             
             #project to final layer to generate current word key, final hidden state used for prediction
             key_cache_i, value_cache_i, hidden_i = self.drop(self.tanh(self.f_norm(self.final_h(intermediate)))).split(self.nhid, dim=-1) #[b * 4d] -> [b * 3d]
-            #update cache
-            #todo: are there possible speedups where there's no need to concatinate dimensions like this?
-            #todo: (cont) maybe one option is torch.zeros() but only do not product on first i tokens, to avoid issue with overwriting
-            #each is [i*b*d]
+            #update memory cache for attention and hidden states
             hidden = torch.cat((hidden, hidden_i.unsqueeze(0)), dim=0)
             key_cache = torch.cat((key_cache, key_cache_i.unsqueeze(0)), dim=0)
             value_cache = torch.cat((value_cache, value_cache_i.unsqueeze(0)), dim=0)
 
 
         output = hidden[1:]
-        decoded = self.decoder(output.view(output.size(0)*output.size(1), output.size(2))) #[35 * 20 * 128] -> reshape [700 * 128]
-        decoded = decoded.view(output.size(0), output.size(1), decoded.size(1)) #
+        decoded = self.decoder(output.view(output.size(0)*output.size(1), output.size(2))) #[n, b, d] -> reshape [(n * b), d]
+        decoded = decoded.view(output.size(0), output.size(1), decoded.size(1))
         if(self.aux_objective):
             decoded_aux = self.aux_decoder((output.view(output.size(0)*output.size(1), output.size(2))))
             decoded_aux = decoded_aux.view(output.size(0), output.size(1), decoded.size(1))
         else:
             decoded_aux = None
-        return decoded, hidden
+        return decoded, hidden, decoded_aux
 
     def init_cache(self, observation):
         if len(observation.size())>1:
