@@ -8,7 +8,7 @@ class RNNModel(nn.Module):
     """Container module with an encoder, a recurrent module, and a decoder."""
 
     def __init__(self, rnn_type, ntoken, ninp, nhid, nlayers,
-                 embedding_file=None, dropout=0.5, tie_weights=False, freeze_embedding=False):
+                 embedding_file=None, dropout=0.5, tie_weights=False, freeze_embedding=False, aux_objective=False):
         super(RNNModel, self).__init__()
         self.drop = nn.Dropout(dropout)
         if embedding_file:
@@ -242,7 +242,7 @@ class CueBasedRNNModel(nn.Module):
         decoded = decoded.view(output.size(0), output.size(1), decoded.size(1))
         if(self.aux_objective):
             decoded_aux = self.aux_decoder((output.view(output.size(0)*output.size(1), output.size(2))))
-            decoded_aux = decoded_aux.view(output.size(0), output.size(1), decoded.size(1))
+            decoded_aux = decoded_aux.view(output.size(0), output.size(1), decoded_aux.size(1))
         else:
             decoded_aux = None
         return decoded, hidden, decoded_aux

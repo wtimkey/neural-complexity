@@ -11,3 +11,8 @@ data/.DS_Store
 .DS_Store
 model_cb_128_lm_3.pt
 model.pt
+ccg_tag_preprocessing/ccgbank
+aux_labels.txt
+ccgbank_supertagged_test.pt
+ccgbank_supertagged_train.pt
+ccgbank_supertagged_valid.pt

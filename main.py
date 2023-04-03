@@ -67,7 +67,7 @@ parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
 parser.add_argument('--init', type=float, default=None,
                     help='-1 to randomly Initialize. Otherwise, all parameter weights set to value')
-parser.add_argument('--auxobjective', action='store_true',
+parser.add_argument('--aux_objective', action='store_true',
                     help='use flag to train on an auxillary objective like CCG supertagging')
 
 # Data parameters
@@ -250,6 +250,7 @@ def get_sent_list_lens_from_data_tensor(data, min_sent_len):
     return idx2sent, sent_lens
 
 def pack_sentences(idx2sent, sent_lens, bptt, bsz, min_sent_len, compute_masks):
+    '''Returns a list of sequences corresponding to sent ids (idx2sent) that should be concatinated'''
     sequences = []
     masks = []
     #heuristic 1: match pairs of sentences whose lengths add up to n, +/- some epsilon
@@ -260,46 +261,60 @@ def pack_sentences(idx2sent, sent_lens, bptt, bsz, min_sent_len, compute_masks):
             if len_a in sent_lens.keys() and len_b in sent_lens.keys():
                 while(len(sent_lens[len_a]) > 0 and len(sent_lens[len_b]) > 0):
                     if(not(sent_lens[len_a] == sent_lens[len_b] and len(sent_lens[len_a]) <= 1)):
-                        sequence, mask = trunc_pad_and_mask(np.concatenate((idx2sent[sent_lens[len_a].pop()], idx2sent[sent_lens[len_b].pop()])), bptt,0, compute_masks)
+                        sequence = [sent_lens[len_a].pop()] + [sent_lens[len_b].pop()]
                         sequences.append(sequence)
-                        masks.append(mask)
                     else:
                         break
     #next add sequences that are too long and truncate them
     for length in sent_lens.keys():
         if(length > bptt - 5):
             while(len(sent_lens[length]) > 0):
-                sequence, mask = trunc_pad_and_mask(idx2sent[sent_lens[length].pop()], bptt, 0, compute_masks)
+                sequence = [sent_lens[length].pop()]
                 sequences.append(sequence)
-                masks.append(mask)
 
     #finally, heuristic 2: from largest to smallest, add sequences until can't anymore (allowing +5 overflow)
     for i in reversed(range((bptt - 5) + 1)): #40, 39, 38...
         if(i in sent_lens.keys()):
             while(len(sent_lens[i]) > 0): 
-                curr_sequence = idx2sent[sent_lens[i].pop()]
+                curr_sequence = [sent_lens[i].pop()]
                 for j in reversed(range(1,i+1)):
                     if(j in sent_lens.keys()):
                         while((len(curr_sequence) + j) < (bptt + 5) and len(sent_lens[j]) > 0):
-                            curr_sequence = np.concatenate((curr_sequence, idx2sent[sent_lens[j].pop()]))
-                sequence, mask = trunc_pad_and_mask(curr_sequence,bptt,0, compute_masks)
-                if(len(sequences) == 45853):
-                    print('')
-                sequences.append(sequence)
-                masks.append(mask)
-    return sequences, masks
+                            curr_sequence += [sent_lens[j].pop()]
+                sequences.append(curr_sequence)
+    return sequences
 
 
-def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=True):
+def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=True, aux_data=None):
     #using (sloppy) heuristics such that every sequence is the start of a sentence, with minimal padding or cropping
     #first split data back into sentences
-    if(compute_masks):
-        print("Packing data into batches + computing sentence-level attention masks")
-    else:
-        print("Packing data into batches")
-
+    masks = None
+    aux_labels = None
+    aux_objective = (aux_data is not None)
     idx2sent, sent_lens = get_sent_list_lens_from_data_tensor(data, min_sent_len)
-    sequences, masks = pack_sentences(idx2sent, sent_lens, bptt, bsz, min_sent_len, compute_masks)
+    if(aux_objective):
+        idx2_sent_aux, _ = get_sent_list_lens_from_data_tensor(aux_data, min_sent_len)
+    sequence_idxs = pack_sentences(idx2sent, sent_lens, bptt, bsz, min_sent_len, compute_masks)
+    sequences = []
+    masks = []
+    aux_sequences = []
+    for seq_idxs_i in sequence_idxs:
+        seq_id_to_tok = []
+        for seq_idx in seq_idxs_i:
+            seq_id_to_tok.extend(idx2sent[seq_idx])
+        seq_id_to_tok = np.array(seq_id_to_tok) 
+        sequence, mask = trunc_pad_and_mask(seq_id_to_tok, bptt, 0, compute_masks)
+        sequences.append(sequence)
+        masks.append(mask)
+
+        if(aux_objective):
+            seq_id_to_tok_aux = []
+            for seq_idx in seq_idxs_i:
+                seq_id_to_tok_aux.extend(idx2_sent_aux[seq_idx])
+            seq_id_to_tok_aux = np.array(seq_id_to_tok_aux)
+            aux_sequence, _ = trunc_pad_and_mask(seq_id_to_tok_aux, bptt, 0, False)
+            aux_sequences.append(aux_sequence)
+
 
     nbatch = len(sequences) // bsz 
     even_seq = bsz * nbatch
@@ -308,8 +323,12 @@ def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=True):
         sequences.append(sequences[even_seq+(i%remainder)])
         if(compute_masks):
             masks.append(masks[even_seq+(i%remainder)])
-    sequences = np.array(sequences)
+        if(aux_objective):
+            aux_sequences.append(aux_sequences[even_seq+(i%remainder)])        
+
     sents = np.array(sequences)
+    if(aux_objective):
+        aux_labels = np.array(aux_sequences)
     if(compute_masks):
         masks = np.array(masks, dtype=np.float32)
 
@@ -318,12 +337,18 @@ def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=True):
     sents = torch.from_numpy(sents[rand_inds])
     sents = sents.view(-1,bsz,bptt)
     sents = sents.swapaxes(1,2)
+    sents.to(device)
     if compute_masks:
         masks = torch.from_numpy(masks[rand_inds])
         masks = masks.view(-1,bsz,bptt,bptt+1)
-        return sents.to(device), masks.to(device)
-    else:
-        return sents.to(device)
+        masks.to(device)
+    if aux_objective:
+        aux_labels = torch.from_numpy(aux_labels[rand_inds])
+        aux_labels = aux_labels.view(-1,bsz,bptt)
+        aux_labels = aux_labels.swapaxes(1,2)
+        aux_labels.to(device)
+
+    return sents, masks, aux_labels
 
 
 
@@ -343,7 +368,8 @@ corpus = data.SentenceCorpus(args.data_dir, args.vocab_file, args.test, args.int
                              lower_flag=args.lowercase,
                              trainfname=args.trainfname,
                              validfname=args.validfname,
-                             testfname=args.testfname)
+                             testfname=args.testfname,
+                             aux_objective_flag=args.aux_objective)
 
 if not args.interact:
     if args.test:
@@ -353,11 +379,21 @@ if not args.interact:
         else:
             test_sents, test_data = corpus.test
     else:
-        compute_masks = args.model == 'CUEBASEDRNN'
-        train_data, train_masks = sent_level_batchify(corpus.train, args.bptt, args.batch_size, compute_masks=compute_masks)
+        compute_masks = (args.model == 'CUEBASEDRNN')
+        if(args.aux_objective):
+            train_aux_data = corpus.train_aux_labels
+            val_aux_data = corpus.valid_aux_labels
+        else:
+            train_aux_data = None
+            val_aux_data = None
+        if(compute_masks):
+            print("Packing data into batches + computing sentence-level attention masks")
+        else:
+            print("Packing data into batches")
+        train_data, train_masks, train_aux_labels = sent_level_batchify(corpus.train, args.bptt, args.batch_size, compute_masks=compute_masks, aux_data=corpus.train_aux_labels)
         #train_data = batchify(corpus.train, args.batch_size)
-        val_data, val_masks = sent_level_batchify(corpus.valid, args.bptt, args.batch_size, compute_masks=compute_masks)
-
+        val_data, val_masks, val_aux_labels = sent_level_batchify(corpus.valid, args.bptt, args.batch_size, compute_masks=compute_masks, aux_data=corpus.valid_aux_labels)
+print('Data processing complete - Building Model')
 ###############################################################################
 # Build/load the model
 ###############################################################################
@@ -373,16 +409,22 @@ if not args.test and not args.interact:
                 model = torch.load(f, map_location='cpu')
     else:
         ntokens = len(corpus.dictionary)
+        if(args.aux_objective):
+            nauxclasses = len(corpus.aux_dictionary)
+        else:
+            nauxclasses = 0
         if(args.model != 'CUEBASEDRNN'):
             model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid,
                                args.nlayers, embedding_file=args.embedding_file,
                                dropout=args.dropout, tie_weights=args.tied,
-                               freeze_embedding=args.freeze_embedding).to(device)
+                               freeze_embedding=args.freeze_embedding, aux_objective=args.aux_objective).to(device)
         else:
             model = model.CueBasedRNNModel(ntokens, args.emsize, args.nhid,
                                args.nlayers, embedding_file=args.embedding_file,
                                dropout=args.dropout, tie_weights=args.tied,
-                               freeze_embedding=args.freeze_embedding).to(device)
+                               freeze_embedding=args.freeze_embedding, 
+                               aux_objective=args.aux_objective,
+                               nauxclasses=nauxclasses).to(device)
 
     if args.cuda and (not args.single) and (torch.cuda.device_count() > 1):
         # If applicable, use multi-gpu for training
@@ -491,7 +533,7 @@ def repackage_hidden(in_state):
     else:
         return tuple(repackage_hidden(value) for value in in_state)
 
-def get_batch(source, i, prebatched=False, masks=None):
+def get_batch(source, i, prebatched=False, masks_source=None, aux_labels_source=None):
     """ get_batch subdivides the source data into chunks of length args.bptt.
     If source is equal to the example output of the batchify function, with
     a bptt-limit of 2, we'd get the following two Variables for i = 0:
@@ -507,12 +549,15 @@ def get_batch(source, i, prebatched=False, masks=None):
         target = source[i+1:i+1+seq_len]
         return data, target.long()
     else:
+        masks = None
+        aux_labels = None
         data = source[i,:-1,:]
         target = source[i,1:,:]
-        if(masks is not None):
-            mask = masks[i,:,:-1,:-1]
-            return data, target.long(), mask
-        return data, target.long()
+        if(masks_source is not None):
+            masks = masks_source[i,:,:-1,:-1]
+        if(aux_labels_source is not None):
+            aux_labels = aux_labels_source[i,:-1,:]
+        return data, target.long(), masks, aux_labels
 
 def test_get_batch(source):
     """ Creates an input/target pair for evaluation """
@@ -639,12 +684,14 @@ def test_evaluate(test_sentences, data_source):
         bar.finish()
     return total_loss / nwords
 
-def evaluate(data_source):
+def evaluate(data_source, aux_source=None):
     """ Evaluate for validation (no adaptation, no complexity output) """
     # Turn on evaluation mode which disables dropout.
     model.eval()
-    total_loss = 0.
+    total_lm_loss = 0.
+    total_aux_loss = 0.
     ntokens = len(corpus.dictionary)
+    nauxclasses = len(corpus.aux_dictionary)
     with torch.no_grad():
         # Construct hidden layers for each sub-batch
         hidden_batch = []
@@ -654,26 +701,33 @@ def evaluate(data_source):
 
         for i in range(data_source.size(0)):
             if(args.model == 'CUEBASEDRNN'):
-                batch_data, batch_targets, batch_masks = get_batch(data_source, i, prebatched=True, masks=val_masks)
-                output, hidden_subbatch, _ = model(batch_data, batch_masks)
+                batch_data, batch_targets, batch_masks, batch_targets_aux = get_batch(data_source, i, prebatched=True, masks_source=val_masks, aux_labels_source=aux_source)
+                output, hidden_subbatch, aux_preds = model(batch_data, batch_masks)
                 hidden_batch.append(hidden_subbatch[-1])  
             else:
                 batch_data, batch_targets = get_batch(data_source, i, prebatched=True)
                 output, hidden_batch = model(batch_data, hidden_batch)
          
-
             output_flat = output.view(-1, ntokens)
-            total_loss += criterion(output_flat, batch_targets.flatten()).sum().item()
-    return total_loss / (data_source.flatten().size(0))
+            lm_loss = criterion(output_flat, batch_targets.flatten()).sum().item()
+            total_lm_loss += lm_loss
+            if(args.aux_objective):
+                aux_preds_flat = aux_preds.view(-1, nauxclasses)
+                aux_loss = criterion(aux_preds_flat, batch_targets_aux.flatten()).sum().item()
+                total_aux_loss += aux_loss
+
+    return (total_lm_loss / (data_source.flatten().size(0))), (total_aux_loss / (data_source.flatten().size(0)))
 
 def train():
     """ Train language model """
     # Turn on training mode which enables dropout.
     model.train()
-    total_loss = 0.
+    total_lm_loss = 0.
+    total_aux_loss = 0.
     total_data = 0.
     start_time = time.time()
     ntokens = len(corpus.dictionary)
+    nauxclasses = len(corpus.aux_dictionary)
     actual_batch_size = int(args.batch_size / args.grad_accumulation_steps)
     hidden_batch = []
     #if model is RNN, then pre-initialize hidden states for the batch, CUE-based model does this in the forward pass (which is bad?)
@@ -683,15 +737,23 @@ def train():
         
     for batch in range(0, train_data.size(0)):
         if(args.model == 'CUEBASEDRNN'):
-            batch_data, batch_targets, batch_masks = get_batch(train_data, batch, prebatched=True, masks=train_masks)
-            output, hidden_batch_all, _ = model(batch_data, masks=batch_masks)
+            batch_data, batch_targets, batch_masks, batch_targets_aux = get_batch(train_data, batch, prebatched=True, masks_source=train_masks, aux_labels_source=train_aux_labels)
+            output, hidden_batch_all, aux_preds = model(batch_data, masks=batch_masks)
             hidden_batch = hidden_batch_all[-1]
         else:
             batch_data, batch_targets = get_batch(train_data, batch)
             output, hidden_batch = model(batch_data, hidden_batch)
-  
-        loss = criterion(output.view(-1, ntokens), batch_targets.flatten())
-        total_loss += loss.sum().item()
+        
+        output_flat = output.view(-1, ntokens)
+        lm_loss = criterion(output_flat, batch_targets.flatten())
+        if(args.aux_objective):
+            aux_preds_flat = aux_preds.view(-1, nauxclasses)
+            aux_loss = criterion(aux_preds_flat, batch_targets_aux.flatten())
+            loss = lm_loss + aux_loss
+        else:
+            loss = lm_loss
+        total_lm_loss += lm_loss.sum().item()
+        total_aux_loss += aux_loss.sum().item()
         loss.mean().backward()
         total_data += batch_data.flatten().size(0)
         
@@ -705,16 +767,19 @@ def train():
         model.zero_grad()
 
         if batch % args.log_interval == 0 and batch > 0:
-            curr_loss = total_loss / total_data
+            curr_lm_loss = total_lm_loss / total_data
+            curr_aux_loss = total_aux_loss / total_data
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.2f} | ms/batch {:5.2f} | '
-                  'loss {:5.2f} | ppl {:8.2f}'.format(
+                  'lm loss {:5.2f} | lm ppl {:8.2f} | aux loss {:5.2f} | aux ppl {:8.2f}'.format(
                       epoch, batch, train_data.size(0), float(optimizer.param_groups[0]['lr']),
-                      elapsed * 1000 / args.log_interval, curr_loss, math.exp(curr_loss)))
-            total_loss = 0.
+                      elapsed * 1000 / args.log_interval, curr_lm_loss, math.exp(curr_lm_loss), curr_aux_loss, math.exp(curr_aux_loss)))
+            total_lm_loss = 0.
+            total_aux_loss = 0.
             total_data = 0.
             start_time = time.time()
 
+print('Beginning evaluation/training')
 # Loop over epochs.
 best_val_loss = None
 no_improvement = 0
@@ -725,26 +790,27 @@ if not args.test and not args.interact:
         for epoch in range(1, args.epochs+1):
             epoch_start_time = time.time()
             train()
-            val_loss = evaluate(val_data)
+            val_lm_loss, val_aux_loss = evaluate(val_data, val_aux_labels)
+            combined_loss = (val_lm_loss + val_aux_loss)
             print('-' * 89)
             print('| end of epoch {:3d} | time: {:5.2f}s | lr: {:4.8f} | '
-                  'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
-                                             float(optimizer.param_groups[0]['lr']), math.exp(val_loss)))
+                  'valid lm ppl {:8.2f} | valid aux ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
+                                             float(optimizer.param_groups[0]['lr']), math.exp(val_lm_loss), math.exp(val_aux_loss)))
             print('-' * 89)
             
             # Save the model if the validation loss is the best we've seen so far.
-            if not best_val_loss or val_loss < best_val_loss:
+            if not best_val_loss or combined_loss< best_val_loss:
                 no_improvement = 0
                 with open(args.model_file, 'wb') as f:
                     torch.save(model, f)
-                    best_val_loss = val_loss
+                    best_val_loss = combined_loss
             else:
                 # Anneal the learning rate if no more improvement in the validation dataset.
                 no_improvement += 1
                 if no_improvement >= 3:
                     print('Covergence achieved! Ending training early')
                     break
-            scheduler.step(val_loss)
+            scheduler.step(combined_loss)
     except KeyboardInterrupt:
         print('-' * 89)
         print('Exiting from training early')
