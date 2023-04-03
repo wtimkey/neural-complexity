@@ -175,7 +175,7 @@ if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
         if torch.cuda.device_count() == 1:
             args.single = True
-
+np.random.seed(args.seed)
 device = torch.device("cuda" if args.cuda else "cpu")
 torch.autograd.set_detect_anomaly(True)
 
@@ -286,16 +286,25 @@ def sent_level_batchify(data, bptt, bsz, min_sent_len=5, compute_masks=False):
                     print('')
                 sequences.append(sequence)
                 masks.append(mask)
+
+
     nbatch = len(sequences) // bsz 
     even_seq = bsz * nbatch
     remainder = len(sequences) - even_seq
     for i in range(bsz-remainder):
         sequences.append(sequences[even_seq+(i%remainder)])
         masks.append(masks[even_seq+(i%remainder)])
-    sents = torch.from_numpy(np.array(sequences))
+    sequences = np.array(sequences)
+    sents = np.array(sequences)
+    masks = np.array(masks, dtype=np.float32)
+
+    rand_inds = np.arange(sents.shape[0])
+    np.random.shuffle(rand_inds)
+    sents = torch.from_numpy(sents[rand_inds])
+    masks = torch.from_numpy(masks[rand_inds])
+
     sents = sents.view(-1,bsz,bptt)
     sents = sents.swapaxes(1,2)
-    masks = torch.from_numpy(np.array(masks, dtype=np.float32))
     masks = masks.view(-1,bsz,bptt,bptt+1)
     return sents.to(device), masks.to(device)
 
@@ -625,7 +634,7 @@ def evaluate(data_source):
             for i in range(args.grad_accumulation_steps):
                 hidden_batch.append(model.init_hidden(args.batch_size))
 
-        for i in range(0, data_source.size(0), args.bptt):
+        for i in range(data_source.size(0)):
             if(args.model != 'CUEBASEDRNN'):
                 batch_data, batch_targets = get_batch(data_source, i)
             else:
@@ -638,7 +647,7 @@ def evaluate(data_source):
                 hidden_batch.append(hidden_subbatch[-1])
             output_flat = output.view(-1, ntokens)
             total_loss += criterion(output_flat, batch_targets.flatten()).sum().item()
-    return total_loss / (data_source.size(0) * args.bsz)
+    return total_loss / (data_source.flatten().size(0))
 
 def train():
     """ Train language model """

@@ -217,7 +217,7 @@ class CueBasedRNNModel(nn.Module):
             #todo: make w_-1 inaccessible for attention after first pass
 
             #[b * i * d] * [b * d * 1] = b * i * 1 squeeze() -> [b * i]
-            attn_scores = torch.bmm(key_cache.swapaxes(0,1), query_n).squeeze(dim=-1) #b * i or b when i=0 - is this a problem?
+            attn_scores = torch.bmm(key_cache.swapaxes(0,1), query_n).squeeze(dim=-1)
             masked_scores = attn_scores + masks[:,i,:i+1]
             #divide scores by sqrt(nhid) for more stable gradients, then compute score using specified function (default: softmax)
             attn_weights = self.score_attn(masked_scores / self.attn_div_factor)  #b * i or b when i=0 - is this a problem?
