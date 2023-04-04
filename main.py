@@ -393,7 +393,7 @@ if not args.interact:
         train_data, train_masks, train_aux_labels = sent_level_batchify(corpus.train, args.bptt, args.batch_size, compute_masks=compute_masks, aux_data=corpus.train_aux_labels)
         #train_data = batchify(corpus.train, args.batch_size)
         val_data, val_masks, val_aux_labels = sent_level_batchify(corpus.valid, args.bptt, args.batch_size, compute_masks=compute_masks, aux_data=corpus.valid_aux_labels)
-print('Data processing complete - Building Model')
+print('Data processing complete; Building model')
 ###############################################################################
 # Build/load the model
 ###############################################################################
@@ -691,7 +691,8 @@ def evaluate(data_source, aux_source=None):
     total_lm_loss = 0.
     total_aux_loss = 0.
     ntokens = len(corpus.dictionary)
-    nauxclasses = len(corpus.aux_dictionary)
+    if(args.aux_objective):
+        nauxclasses = len(corpus.aux_dictionary)
     with torch.no_grad():
         # Construct hidden layers for each sub-batch
         hidden_batch = []

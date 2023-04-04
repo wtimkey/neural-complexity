@@ -8,7 +8,7 @@ class RNNModel(nn.Module):
     """Container module with an encoder, a recurrent module, and a decoder."""
 
     def __init__(self, rnn_type, ntoken, ninp, nhid, nlayers,
-                 embedding_file=None, dropout=0.5, tie_weights=False, freeze_embedding=False, aux_objective=False):
+                 embedding_file=None, dropout=0.5, tie_weights=False, freeze_embedding=False, aux_objective=False, nauxclasses=0):
         super(RNNModel, self).__init__()
         self.drop = nn.Dropout(dropout)
         if embedding_file:
@@ -27,6 +27,11 @@ class RNNModel(nn.Module):
                                  options are ['LSTM', 'GRU', 'RNN_TANH' or 'RNN_RELU']""")
             self.rnn = nn.RNN(ninp, nhid, nlayers, nonlinearity=nonlinearity, dropout=dropout)
         self.decoder = nn.Linear(nhid, ntoken)
+        self.aux_objective = aux_objective
+        self.nauxclasses = nauxclasses
+        
+        if(aux_objective):
+            self.aux_decoder = nn.Linear(nhid, nauxclasses)
 
         self.init_weights(freeze_embedding)
         if freeze_embedding:
@@ -86,7 +91,13 @@ class RNNModel(nn.Module):
         output, hidden = self.rnn(emb, hidden)
         output = self.drop(output)
         decoded = self.decoder(output.view(output.size(0)*output.size(1), output.size(2)))
-        return decoded.view(output.size(0), output.size(1), decoded.size(1)), hidden
+        decoded = decoded.view(output.size(0), output.size(1), decoded.size(1))
+        if(self.aux_objective):
+            decoded_aux = self.aux_decoder((output.view(output.size(0)*output.size(1), output.size(2))))
+            decoded_aux = decoded_aux.view(output.size(0), output.size(1), decoded_aux.size(1))
+        else:
+            decoded_aux = None
+        return decoded, hidden, decoded_aux
 
     def init_hidden(self, bsz):
         """ Initialize a fresh hidden state """
